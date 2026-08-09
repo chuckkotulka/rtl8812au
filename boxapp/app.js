@@ -108,6 +108,10 @@
         if (typeof it === 'string') return { id: uid(), name: it, qty: 1 };
         return { id: it.id || uid(), name: it.name || '', qty: Number(it.qty) > 0 ? Number(it.qty) : 1 };
       }) : [],
+      // Only the references live here; the image data itself is in IndexedDB.
+      photos: Array.isArray(b.photos) ? b.photos.map(function (p) {
+        return { id: p.id || uid(), w: p.w || 0, h: p.h || 0, addedAt: p.addedAt || Date.now() };
+      }) : [],
       createdAt: b.createdAt || Date.now(),
       updatedAt: b.updatedAt || b.createdAt || Date.now()
     };
@@ -140,6 +144,10 @@
   }
 
   function deleteBox(id) {
+    var box = boxById(id);
+    if (box && box.photos.length) {
+      photos.remove(box.photos.map(function (p) { return p.id; }));
+    }
     state.boxes = state.boxes.filter(function (b) { return b.id !== id; });
     save();
   }
@@ -240,6 +248,185 @@
     return added;
   }
 
+  /* ----------------------------------------------------------------- photos
+
+     Photographs are far too big for localStorage — a handful of them would blow
+     the quota and take the whole inventory down with them. The pictures live in
+     IndexedDB instead, keyed by photo id, and each one is stored twice: a full
+     size for looking at and a thumbnail so lists stay quick. */
+
+  var photos = {
+    DB: 'boxly-photos',
+    STORE: 'photos',
+    MAX_EDGE: 1600,
+    THUMB_EDGE: 320,
+    db: null,
+    blocked: false,
+
+    open: function () {
+      var self = this;
+      if (this.db) return Promise.resolve(this.db);
+      if (this.blocked) return Promise.reject(new Error('unavailable'));
+      return new Promise(function (resolve, reject) {
+        var req;
+        try { req = indexedDB.open(self.DB, 1); } catch (e) { self.blocked = true; return reject(e); }
+        req.onupgradeneeded = function () {
+          var db = req.result;
+          if (!db.objectStoreNames.contains(self.STORE)) db.createObjectStore(self.STORE, { keyPath: 'id' });
+        };
+        req.onsuccess = function () { self.db = req.result; resolve(self.db); };
+        req.onerror = function () { self.blocked = true; reject(req.error); };
+        req.onblocked = function () { self.blocked = true; reject(new Error('blocked')); };
+      });
+    },
+
+    tx: function (mode, fn) {
+      var self = this;
+      return this.open().then(function (db) {
+        return new Promise(function (resolve, reject) {
+          var t = db.transaction(self.STORE, mode);
+          var store = t.objectStore(self.STORE);
+          var out = fn(store);
+          t.oncomplete = function () { resolve(out && out.result !== undefined ? out.result : out); };
+          t.onerror = function () { reject(t.error); };
+          t.onabort = function () { reject(t.error || new Error('aborted')); };
+        });
+      });
+    },
+
+    put: function (record) {
+      return this.tx('readwrite', function (store) { return store.put(record); });
+    },
+
+    get: function (id) {
+      return this.tx('readonly', function (store) { return store.get(id); });
+    },
+
+    remove: function (ids) {
+      var list = [].concat(ids);
+      return this.tx('readwrite', function (store) {
+        list.forEach(function (id) { store.delete(id); });
+      }).catch(function () {});
+    },
+
+    all: function () {
+      return this.tx('readonly', function (store) { return store.getAll(); });
+    },
+
+    clear: function () {
+      return this.tx('readwrite', function (store) { return store.clear(); }).catch(function () {});
+    },
+
+    /* Phone cameras produce 4-12 megapixel files. Storing those as-is would fill
+       the disk for no visible gain, so both sizes are re-encoded as JPEG. */
+    ingest: function (file) {
+      var self = this;
+      return this.decode(file).then(function (img) {
+        var full = self.render(img, self.MAX_EDGE, 0.82);
+        var thumb = self.render(img, self.THUMB_EDGE, 0.72);
+        if (img.close) img.close();
+        return Promise.all([full.blob, thumb.blob]).then(function (blobs) {
+          return { full: blobs[0], thumb: blobs[1], w: full.w, h: full.h };
+        });
+      });
+    },
+
+    decode: function (file) {
+      if (window.createImageBitmap) {
+        // Honours the EXIF rotation a phone writes instead of showing it sideways.
+        return createImageBitmap(file, { imageOrientation: 'from-image' })
+          .catch(function () { return createImageBitmap(file); })
+          .catch(function () { return photos.decodeViaImg(file); });
+      }
+      return this.decodeViaImg(file);
+    },
+
+    decodeViaImg: function (file) {
+      return new Promise(function (resolve, reject) {
+        var url = URL.createObjectURL(file);
+        var img = new Image();
+        img.onload = function () { URL.revokeObjectURL(url); resolve(img); };
+        img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('That file is not an image we can read')); };
+        img.src = url;
+      });
+    },
+
+    render: function (img, maxEdge, quality) {
+      var sw = img.width || img.naturalWidth;
+      var sh = img.height || img.naturalHeight;
+      var scale = Math.min(1, maxEdge / Math.max(sw, sh));
+      var w = Math.max(1, Math.round(sw * scale));
+      var h = Math.max(1, Math.round(sh * scale));
+      var canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      var blob = new Promise(function (resolve) {
+        if (canvas.toBlob) canvas.toBlob(function (b) { resolve(b); }, 'image/jpeg', quality);
+        else resolve(dataUrlToBlob(canvas.toDataURL('image/jpeg', quality)));
+      });
+      return { blob: blob, w: w, h: h };
+    },
+
+    /* Adds one file to a box: decode, shrink, store, then record the reference. */
+    add: function (box, file) {
+      var self = this;
+      if (!/^image\//.test(file.type)) return Promise.reject(new Error('Only image files can be added'));
+      return this.ingest(file).then(function (out) {
+        var id = uid();
+        return self.put({ id: id, full: out.full, thumb: out.thumb }).then(function () {
+          box.photos.push({ id: id, w: out.w, h: out.h, addedAt: Date.now() });
+          touch(box);
+          return id;
+        });
+      });
+    },
+
+    detach: function (box, photoId) {
+      box.photos = box.photos.filter(function (p) { return p.id !== photoId; });
+      touch(box);
+      return this.remove(photoId);
+    }
+  };
+
+  /* Object URLs are handed out for display; every view that makes them registers
+     them here so a re-render can hand the memory back. */
+  var urlBag = {
+    urls: [],
+    make: function (blob) {
+      var url = URL.createObjectURL(blob);
+      this.urls.push(url);
+      return url;
+    },
+    releaseAll: function () {
+      this.urls.forEach(function (u) { URL.revokeObjectURL(u); });
+      this.urls = [];
+    }
+  };
+
+  function dataUrlToBlob(dataUrl) {
+    var parts = String(dataUrl).split(',');
+    var mime = (parts[0].match(/:(.*?);/) || [])[1] || 'image/jpeg';
+    var bin = atob(parts[1] || '');
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(String(reader.result)); };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function photoCount() {
+    return state.boxes.reduce(function (n, b) { return n + b.photos.length; }, 0);
+  }
+
   /* ------------------------------------------------------- toasts & dialogs */
 
   function toast(msg, kind) {
@@ -287,6 +474,93 @@
       var input = $('#sheet-input', dlg);
       if (input) { input.focus(); input.select(); }
     });
+  }
+
+  /* Full-size viewer. Also where a photo gets promoted to cover or thrown away. */
+  function openPhotoViewer(box, photoId, onChange) {
+    var index = box.photos.findIndex(function (p) { return p.id === photoId; });
+    if (index < 0) return;
+
+    var dlg = document.createElement('dialog');
+    dlg.className = 'sheet viewer';
+    dlg.innerHTML =
+      '<div class="viewer-stage">' +
+        '<img id="v-img" alt="">' +
+        '<button class="viewer-nav prev" data-step="-1" aria-label="Previous photo">' +
+          '<svg viewBox="0 0 24 24"><path d="M15 19 8 12l7-7"/></svg></button>' +
+        '<button class="viewer-nav next" data-step="1" aria-label="Next photo">' +
+          '<svg viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg></button>' +
+      '</div>' +
+      '<div class="viewer-bar">' +
+        '<span class="small muted" id="v-count"></span>' +
+        '<span class="spacer"></span>' +
+        '<button class="btn btn-sm" data-act="cover">Make cover</button>' +
+        '<button class="btn btn-sm btn-danger" data-act="delete">' + ICON.trash + 'Delete</button>' +
+        '<button class="btn btn-sm btn-ghost" data-act="close">Close</button>' +
+      '</div>';
+    document.body.appendChild(dlg);
+
+    var shown = null;
+    function paint() {
+      if (!box.photos.length) { dlg.close(); return; }
+      index = Math.max(0, Math.min(index, box.photos.length - 1));
+      var photo = box.photos[index];
+      $('#v-count', dlg).textContent = (index + 1) + ' of ' + box.photos.length +
+        (index === 0 ? ' · cover' : '');
+      $$('.viewer-nav', dlg).forEach(function (b) { b.hidden = box.photos.length < 2; });
+      $('[data-act="cover"]', dlg).hidden = index === 0;  // already the cover
+      photos.get(photo.id).then(function (rec) {
+        if (!rec || !rec.full) return;
+        if (shown) URL.revokeObjectURL(shown);
+        shown = URL.createObjectURL(rec.full);
+        var img = $('#v-img', dlg);
+        img.src = shown;
+        img.alt = 'Photo ' + (index + 1) + ' of ' + boxTitle(box);
+      });
+    }
+    paint();
+
+    dlg.addEventListener('click', function (e) {
+      var step = e.target.closest('[data-step]');
+      if (step) {
+        index = (index + Number(step.getAttribute('data-step')) + box.photos.length) % box.photos.length;
+        return paint();
+      }
+      var act = e.target.closest('[data-act]');
+      if (!act) return;
+      var which = act.getAttribute('data-act');
+      if (which === 'close') return dlg.close();
+      if (which === 'cover') {
+        box.photos.unshift(box.photos.splice(index, 1)[0]);
+        index = 0;
+        touch(box);
+        onChange();
+        paint();
+        toast('Cover photo set', 'ok');
+      }
+      if (which === 'delete') {
+        photos.detach(box, box.photos[index].id);
+        onChange();
+        paint();
+        toast('Photo deleted');
+      }
+    });
+
+    dlg.addEventListener('keydown', function (e) {
+      if (!box.photos.length || box.photos.length < 2) return;
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        index = (index + (e.key === 'ArrowRight' ? 1 : -1) + box.photos.length) % box.photos.length;
+        paint();
+      }
+    });
+
+    dlg.addEventListener('close', function () {
+      if (shown) URL.revokeObjectURL(shown);
+      dlg.remove();
+    });
+
+    dlg.showModal();
   }
 
   /* --------------------------------------------------------------------- qr */
@@ -524,17 +798,42 @@
       return (i.qty > 1 ? i.qty + '× ' : '') + i.name;
     }).join(' · ');
     var more = box.items.length > 6 ? ' +' + (box.items.length - 6) + ' more' : '';
-    return '<a class="box-card" href="#/box/' + esc(box.id) + '">' +
-      '<h3>' + highlight(boxTitle(box), query) + '</h3>' +
-      '<div class="box-meta">' +
-        locChip(box) +
-        '<span class="chip chip-code">' + highlight(box.code, query) + '</span>' +
-        '<span class="chip">' + box.items.length + (box.items.length === 1 ? ' item' : ' items') + '</span>' +
-      '</div>' +
-      (box.items.length
-        ? '<div class="box-items">' + highlight(items, query) + esc(more) + '</div>'
-        : '<div class="box-items muted">Nothing listed inside yet</div>') +
+    var cover = box.photos[0];
+    return '<a class="box-card' + (cover ? ' has-cover' : '') + '" href="#/box/' + esc(box.id) + '">' +
+      (cover
+        ? '<span class="card-cover" data-photo="' + esc(cover.id) + '" data-alt="' + esc(boxTitle(box)) + '"></span>'
+        : '') +
+      '<span class="card-body">' +
+        '<h3>' + highlight(boxTitle(box), query) + '</h3>' +
+        '<span class="box-meta">' +
+          locChip(box) +
+          '<span class="chip chip-code">' + highlight(box.code, query) + '</span>' +
+          '<span class="chip">' + box.items.length + (box.items.length === 1 ? ' item' : ' items') + '</span>' +
+          (box.photos.length > 1 ? '<span class="chip">' + box.photos.length + ' photos</span>' : '') +
+        '</span>' +
+        (box.items.length
+          ? '<span class="box-items">' + highlight(items, query) + esc(more) + '</span>'
+          : '<span class="box-items muted">Nothing listed inside yet</span>') +
+      '</span>' +
     '</a>';
+  }
+
+  /* Tiles and covers render empty, then fill in as their thumbnails come back
+     from IndexedDB — a list of forty boxes never waits on disk to paint. */
+  function hydratePhotos(root) {
+    $$('[data-photo]', root).forEach(function (el) {
+      if (el.dataset.hydrated) return;
+      el.dataset.hydrated = '1';
+      photos.get(el.getAttribute('data-photo')).then(function (rec) {
+        if (!rec || !rec.thumb || !el.isConnected) return;
+        var img = document.createElement('img');
+        img.alt = el.getAttribute('data-alt') || '';
+        img.decoding = 'async';
+        img.src = urlBag.make(rec.thumb);
+        el.appendChild(img);
+        el.classList.add('is-loaded');
+      }).catch(function () {});
+    });
   }
 
   /* ------------------------------------------------------------ view: boxes */
@@ -571,6 +870,8 @@
       (list.length
         ? '<div class="box-grid">' + list.map(function (b) { return boxCard(b, q); }).join('') + '</div>'
         : emptyState(q));
+
+    hydratePhotos(root);
 
     $$('[data-sort]', root).forEach(function (btn) {
       btn.addEventListener('click', function () {
@@ -641,6 +942,18 @@
         '</label>' +
       '</div>' +
 
+      '<div class="card section" id="photo-card">' +
+        '<h2>Photos <span class="muted" id="photo-total"></span>' +
+          '<label class="btn btn-sm head-action" id="photo-add-btn">' + ICON.plus + 'Add photo' +
+            '<input type="file" accept="image/*" multiple class="sr-only" id="photo-file">' +
+          '</label>' +
+        '</h2>' +
+        '<div class="photo-strip" id="photo-strip"></div>' +
+        '<div class="small muted" style="margin-top:10px" id="photo-hint">' +
+          'A picture of the open box beats a list you did not finish writing. The first one shows up in your box list.' +
+        '</div>' +
+      '</div>' +
+
       '<div class="card section">' +
         '<h2>What is inside <span class="muted" id="item-count"></span></h2>' +
         '<div id="items"></div>' +
@@ -685,6 +998,63 @@
       }).join('');
     }
     renderItems();
+
+    function renderPhotos() {
+      var host = $('#photo-strip', root);
+      $('#photo-total', root).textContent = box.photos.length ? '· ' + box.photos.length : '';
+      // The strip scrolls, so the only always-reachable place for "add" is the header.
+      // The dashed tile is the empty state, and points at that same input.
+      host.innerHTML =
+        box.photos.map(function (p, i) {
+          return '<button type="button" class="photo-tile" data-open="' + esc(p.id) + '" ' +
+            'data-photo="' + esc(p.id) + '" data-alt="Photo of ' + esc(boxTitle(box)) + '" ' +
+            'aria-label="Open photo ' + (i + 1) + ' of ' + box.photos.length + '">' +
+            (i === 0 && box.photos.length > 1 ? '<span class="photo-badge">Cover</span>' : '') +
+          '</button>';
+        }).join('') +
+        (box.photos.length || photos.blocked
+          ? ''
+          : '<label class="photo-add" for="photo-file">' +
+              '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>' +
+              '<span>Add a photo</span>' +
+            '</label>');
+      hydratePhotos(host);
+
+      if (photos.blocked) {
+        $('#photo-add-btn', root).hidden = true;
+        $('#photo-hint', root).textContent =
+          'Photos need a browser that allows local file storage. Serving this page over http:// or https:// instead of opening the file directly usually fixes it.';
+      }
+    }
+    renderPhotos();
+
+    var busy = false;
+    $('#photo-card', root).addEventListener('change', function (e) {
+      var input = e.target.closest('#photo-file');
+      if (!input || !input.files || !input.files.length || busy) return;
+      var files = Array.prototype.slice.call(input.files);
+      input.value = '';
+      busy = true;
+      toast(files.length === 1 ? 'Adding photo…' : 'Adding ' + files.length + ' photos…');
+
+      // One at a time: a phone decoding six full-resolution frames at once runs out of memory.
+      files.reduce(function (chain, file) {
+        return chain.then(function () { return photos.add(box, file); });
+      }, Promise.resolve()).then(function () {
+        toast(files.length === 1 ? 'Photo added' : files.length + ' photos added', 'ok');
+      }).catch(function (err) {
+        toast(err && err.message ? err.message : 'That photo could not be saved', 'warn');
+      }).then(function () {
+        busy = false;
+        renderPhotos();
+        noteSaved();
+      });
+    });
+
+    $('#photo-strip', root).addEventListener('click', function (e) {
+      var tile = e.target.closest('[data-open]');
+      if (tile) openPhotoViewer(box, tile.getAttribute('data-open'), renderPhotos);
+    });
 
     var saveLocation = debounce(function (val) {
       box.location = val.trim();
@@ -1207,6 +1577,7 @@
       '<div class="stat-grid">' +
         '<div class="stat"><div class="n">' + state.boxes.length + '</div><div class="k">Boxes</div></div>' +
         '<div class="stat"><div class="n">' + totalItems + '</div><div class="k">Items</div></div>' +
+        '<div class="stat"><div class="n">' + photoCount() + '</div><div class="k">Photos</div></div>' +
         '<div class="stat"><div class="n">' + locations().length + '</div><div class="k">Locations</div></div>' +
         '<div class="stat"><div class="n">' + (state.boxes.length - placed) + '</div><div class="k">Unplaced</div></div>' +
       '</div>' +
@@ -1219,7 +1590,14 @@
           '<label class="btn" for="import-file" style="cursor:pointer">Import JSON' +
             '<input id="import-file" type="file" accept="application/json,.json" class="sr-only"></label>' +
         '</div>' +
+        (photoCount()
+          ? '<label class="row-tight" style="margin-top:12px;cursor:pointer">' +
+              '<input type="checkbox" id="with-photos" style="width:17px;height:17px;accent-color:var(--accent)" checked>' +
+              '<span class="small">Include photos in the JSON backup — bigger file, but nothing is left behind</span>' +
+            '</label>'
+          : '') +
         '<div class="small muted" style="margin-top:10px">Importing merges by QR code: matching boxes are updated, new ones are added.</div>' +
+        '<div class="small muted" style="margin-top:4px" id="storage-line"></div>' +
       '</div>' +
 
       '<div class="card section">' +
@@ -1237,10 +1615,45 @@
         '<button class="btn btn-danger" data-act="wipe">' + ICON.trash + 'Erase everything</button>' +
       '</div>';
 
+    var stamp = function () { return new Date().toISOString().slice(0, 10); };
+
     $('[data-act="export"]', root).addEventListener('click', function () {
-      download('boxly-' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify(state, null, 2));
-      toast('Backup downloaded', 'ok');
+      var withPhotos = $('#with-photos', root);
+      var payload = JSON.parse(JSON.stringify(state));
+      if (!withPhotos || !withPhotos.checked || !photoCount()) {
+        download('boxly-' + stamp() + '.json', JSON.stringify(payload, null, 2));
+        toast('Backup downloaded', 'ok');
+        return;
+      }
+      toast('Packing photos…');
+      photos.all().then(function (records) {
+        var wanted = {};
+        state.boxes.forEach(function (b) { b.photos.forEach(function (p) { wanted[p.id] = true; }); });
+        var keep = (records || []).filter(function (r) { return wanted[r.id]; });
+        return Promise.all(keep.map(function (r) {
+          return Promise.all([blobToDataUrl(r.full), blobToDataUrl(r.thumb)]).then(function (pair) {
+            return { id: r.id, full: pair[0], thumb: pair[1] };
+          });
+        }));
+      }).then(function (photoData) {
+        payload.photoData = photoData;
+        download('boxly-' + stamp() + '.json', JSON.stringify(payload));
+        toast(photoData.length + ' photos included', 'ok');
+      }).catch(function () {
+        toast('Photos could not be read — exported without them', 'warn');
+        download('boxly-' + stamp() + '.json', JSON.stringify(payload, null, 2));
+      });
     });
+
+    // Browsers only report a rough figure, so this is a sanity check, not accounting.
+    if (navigator.storage && navigator.storage.estimate) {
+      navigator.storage.estimate().then(function (est) {
+        var line = $('#storage-line', root);
+        if (!line || !est || !est.usage) return;
+        line.textContent = 'Using about ' + (est.usage / 1048576).toFixed(1) + ' MB on this device' +
+          (est.quota ? ' of roughly ' + (est.quota / 1048576).toFixed(0) + ' MB available.' : '.');
+      }).catch(function () {});
+    }
 
     $('[data-act="csv"]', root).addEventListener('click', function () {
       var rows = [['box_code', 'box_name', 'location', 'item', 'qty', 'notes']];
@@ -1270,6 +1683,11 @@
         data.boxes.map(normalizeBox).forEach(function (incoming) {
           var existing = boxByCode(incoming.code);
           if (existing) {
+            // The replaced box's own photos would otherwise sit in storage forever.
+            var orphans = existing.photos.filter(function (p) {
+              return !incoming.photos.some(function (q) { return q.id === p.id; });
+            }).map(function (p) { return p.id; });
+            if (orphans.length) photos.remove(orphans);
             incoming.id = existing.id;
             state.boxes[state.boxes.indexOf(existing)] = incoming;
             updated++;
@@ -1279,8 +1697,20 @@
           }
         });
         save();
-        toast(added + ' added · ' + updated + ' updated', 'ok');
-        render();
+
+        var pics = Array.isArray(data.photoData) ? data.photoData : [];
+        if (!pics.length) {
+          toast(added + ' added · ' + updated + ' updated', 'ok');
+          render();
+          return;
+        }
+        Promise.all(pics.map(function (rec) {
+          return photos.put({ id: rec.id, full: dataUrlToBlob(rec.full), thumb: dataUrlToBlob(rec.thumb || rec.full) });
+        })).then(function () {
+          toast(added + ' added · ' + updated + ' updated · ' + pics.length + ' photos', 'ok');
+        }).catch(function () {
+          toast('Boxes imported, but the photos could not be stored', 'warn');
+        }).then(function () { render(); });
       };
       reader.readAsText(file);
       e.target.value = '';
@@ -1299,13 +1729,14 @@
     $('[data-act="wipe"]', root).addEventListener('click', function () {
       confirmSheet({
         title: 'Erase everything?',
-        body: 'All ' + state.boxes.length + ' boxes are removed from this device. Export a backup first if you might want them back.',
+        body: 'All ' + state.boxes.length + ' boxes and ' + photoCount() + ' photos are removed from this device. Export a backup first if you might want them back.',
         confirm: 'Erase everything',
         danger: true
       }).then(function (ok) {
         if (!ok) return;
         state.boxes = [];
         save();
+        photos.clear();
         toast('All boxes erased');
         render();
       });
@@ -1340,6 +1771,7 @@
     var section = route.parts[0] || 'boxes';
 
     if (section !== 'scan') scanner.stop();
+    urlBag.releaseAll();
 
     root.innerHTML = '';
     if (section === 'scan') viewScan(root);
@@ -1364,6 +1796,7 @@
   function boot() {
     load();
     applyTheme();
+    photos.open().catch(function () { photos.blocked = true; });
 
     var search = $('#global-search');
     search.addEventListener('input', debounce(function () {

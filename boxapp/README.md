@@ -39,6 +39,11 @@ screen between scans.
 records a quantity; commas split one line into several items. Everything saves as
 you type.
 
+**Photos** — pictures of the box, its contents, or the serial number on the back of
+something. Take them with the phone camera or pick them from the library; the first
+one becomes the cover shown in your box list. Files are downscaled to 1600px and
+re-encoded as JPEG, and each one also gets a thumbnail so long lists stay quick.
+
 **Search** — one field across box names, codes, locations, notes and item names.
 Searching `blender` tells you which box it is in and where that box is standing.
 
@@ -52,7 +57,19 @@ before you pack it. Print styles are set in millimetres and avoid breaking a lab
 across pages.
 
 **Data** — JSON export/import (import merges by QR code) and a CSV of every item
-for spreadsheets. Worth exporting before you switch phones.
+for spreadsheets. Photos ride along in the JSON backup unless you untick the box.
+Worth exporting before you switch phones.
+
+## Where things are kept
+
+Boxes, items and locations are small, so they live in `localStorage` under
+`boxly.v1`. Photographs are not small — a handful of them would blow that quota and
+take the inventory down with them — so the image data goes in IndexedDB
+(`boxly-photos`), two blobs per photo: a 1600px version and a 320px thumbnail. The
+box record only stores photo ids.
+
+If a browser refuses IndexedDB (a sandboxed frame, some private-browsing modes), the
+photo controls hide themselves and say why; everything else keeps working.
 
 ## Codes
 
