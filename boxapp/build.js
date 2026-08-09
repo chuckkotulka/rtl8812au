@@ -27,11 +27,19 @@ if (/<(link|script)[^>]+(href|src)="(?!https?:)/.test(html)) {
 fs.mkdirSync(dist, { recursive: true });
 fs.writeFileSync(path.join(dist, 'boxly.html'), html);
 
-// Fragment build: keep <title> and the inlined <style>, drop the document scaffolding.
+// Fragment build: keep <title> and every inlined <style>, drop the document scaffolding.
 const title = (html.match(/<title>[\s\S]*?<\/title>/) || [''])[0];
-const style = (html.match(/<style>[\s\S]*?<\/style>/) || [''])[0];
+const styles = html.match(/<style>[\s\S]*?<\/style>/g) || [];
 const body = (html.match(/<body>([\s\S]*)<\/body>/) || ['', ''])[1];
-fs.writeFileSync(path.join(dist, 'boxly.artifact.html'), [title, style, body.trim(), ''].join('\n'));
+const fragment = [title, ...styles, body.trim(), ''].join('\n');
+
+const styleCount = (html.match(/<style>/g) || []).length;
+if (styles.length !== styleCount) {
+  console.error(`Refusing to write: kept ${styles.length} of ${styleCount} stylesheets.`);
+  process.exit(1);
+}
+
+fs.writeFileSync(path.join(dist, 'boxly.artifact.html'), fragment);
 
 for (const f of ['boxly.html', 'boxly.artifact.html']) {
   const kb = (fs.statSync(path.join(dist, f)).size / 1024).toFixed(0);
